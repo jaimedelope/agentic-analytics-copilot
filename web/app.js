@@ -1,76 +1,207 @@
-/** Browser simulation of the multi-agent analytics copilot. */
+/**
+ * Live browser copilot: DuckDB-WASM gold marts + multi-agent tool loop.
+ * No fake numbers — every answer comes from a real SELECT.
+ */
 
-const GOLD = {
-  gmv: { gmv_eur: 48720.5, orders: 1184, aov_eur: 41.15 },
-  conversion: {
-    views: 9840,
-    carts: 3210,
-    checkouts: 1422,
-    view_to_cart_pct: 32.6,
-    view_to_checkout_pct: 14.5,
-  },
-  countries: [
-    { country: "ES", revenue_eur: 11240, customers: 6, avg_ltv: 1873.3 },
-    { country: "FR", revenue_eur: 9860, customers: 5, avg_ltv: 1972.0 },
-    { country: "DE", revenue_eur: 8740, customers: 4, avg_ltv: 2185.0 },
-    { country: "US", revenue_eur: 7120, customers: 4, avg_ltv: 1780.0 },
-    { country: "GB", revenue_eur: 5340, customers: 3, avg_ltv: 1780.0 },
-  ],
-  customers: [
-    { customer_id: "cus_a105", country: "IT", orders_count: 9, lifetime_revenue_eur: 1540 },
-    { customer_id: "cus_a102", country: "DE", orders_count: 8, lifetime_revenue_eur: 1422 },
-    { customer_id: "cus_a108", country: "ES", orders_count: 7, lifetime_revenue_eur: 1310 },
-  ],
-  trend: [
-    { order_date: "2026-10-30", orders_count: 52, revenue_eur: 2140, avg_order_value: 41.15 },
-    { order_date: "2026-10-31", orders_count: 58, revenue_eur: 2380, avg_order_value: 41.03 },
-    { order_date: "2026-11-01", orders_count: 61, revenue_eur: 2510, avg_order_value: 41.15 },
-    { order_date: "2026-11-02", orders_count: 64, revenue_eur: 2688, avg_order_value: 42.0 },
-  ],
-};
+import * as duckdb from "https://cdn.jsdelivr.net/npm/@duckdb/duckdb-wasm@1.29.0/+esm";
 
 const TEMPLATES = {
   gmv: {
     label: "Gross merchandise value",
-    sql: "select round(sum(revenue_eur),2) as gmv_eur, sum(orders_count) as orders, round(sum(revenue_eur)/sum(orders_count),2) as aov_eur from gold.revenue_daily",
-    rows: [GOLD.gmv],
+    sql: `select round(sum(revenue_eur), 2) as gmv_eur,
+                 sum(orders_count) as orders,
+                 round(sum(revenue_eur) / nullif(sum(orders_count), 0), 2) as aov_eur
+          from gold.revenue_daily`,
   },
   aov: {
     label: "Average order value",
-    sql: "select round(sum(revenue_eur)/sum(orders_count),2) as aov_eur, sum(orders_count) as orders from gold.revenue_daily",
-    rows: [{ aov_eur: GOLD.gmv.aov_eur, orders: GOLD.gmv.orders }],
+    sql: `select round(sum(revenue_eur) / nullif(sum(orders_count), 0), 2) as aov_eur,
+                 sum(orders_count) as orders
+          from gold.revenue_daily`,
   },
   conversion: {
     label: "Funnel conversion",
-    sql: "select sum(views) views, sum(add_to_cart) carts, sum(checkouts) checkouts, round(100.0*sum(add_to_cart)/sum(views),1) view_to_cart_pct, round(100.0*sum(checkouts)/sum(views),1) view_to_checkout_pct from gold.funnel_daily",
-    rows: [GOLD.conversion],
+    sql: `select sum(views) as views,
+                 sum(add_to_cart) as carts,
+                 sum(checkouts) as checkouts,
+                 round(100.0 * sum(add_to_cart) / nullif(sum(views), 0), 1) as view_to_cart_pct,
+                 round(100.0 * sum(checkouts) / nullif(sum(views), 0), 1) as view_to_checkout_pct
+          from gold.funnel_daily`,
   },
   top_customers: {
     label: "Top customers by LTV",
-    sql: "select customer_id, country, orders_count, lifetime_revenue_eur from gold.customer_ltv order by lifetime_revenue_eur desc limit 8",
-    rows: GOLD.customers,
+    sql: `select customer_id, country, orders_count, lifetime_revenue_eur
+          from gold.customer_ltv
+          order by lifetime_revenue_eur desc
+          limit 8`,
   },
   by_country: {
     label: "Revenue by country",
-    sql: "select country, revenue_eur, customers, avg_ltv from gold.revenue_by_country order by revenue_eur desc",
-    rows: GOLD.countries,
+    sql: `select country, revenue_eur, customers, avg_ltv
+          from gold.revenue_by_country
+          order by revenue_eur desc`,
   },
   revenue_trend: {
     label: "Revenue trend (last 14 days)",
-    sql: "select order_date, orders_count, revenue_eur, avg_order_value from gold.revenue_daily order by order_date desc limit 14",
-    rows: [...GOLD.trend].reverse(),
+    sql: `select cast(order_date as varchar) as order_date, orders_count, revenue_eur, avg_order_value
+          from gold.revenue_daily
+          order by order_date desc
+          limit 14`,
   },
 };
+
+const EXAMPLES = [
+  "What is our GMV and AOV?",
+  "How is the conversion funnel performing?",
+  "Who are the top customers by LTV?",
+  "Break down revenue by country",
+  "Show revenue trend for recent days",
+  "¿Cuál es el ticket medio y la conversión?",
+];
+
+let conn = null;
+
+function mulberry32(a) {
+  return function () {
+    let t = (a += 0x6d2b79f5);
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function isoDate(d) {
+  return d.toISOString().slice(0, 10);
+}
+
+async function seedGold(connection) {
+  await connection.query("create schema if not exists gold");
+  await connection.query(`
+    create table gold.revenue_daily (
+      order_date date,
+      orders_count integer,
+      buyers integer,
+      revenue_eur double,
+      avg_order_value double
+    )
+  `);
+  await connection.query(`
+    create table gold.funnel_daily (
+      event_date date,
+      views integer,
+      add_to_cart integer,
+      checkouts integer,
+      searches integer
+    )
+  `);
+  await connection.query(`
+    create table gold.customer_ltv (
+      customer_id varchar,
+      country varchar,
+      orders_count integer,
+      lifetime_revenue_eur double
+    )
+  `);
+
+  const rng = mulberry32(42);
+  const countries = ["ES", "FR", "DE", "US", "GB", "IT"];
+  const today = new Date();
+  const revenueRows = [];
+  const funnelRows = [];
+
+  for (let i = 0; i < 21; i += 1) {
+    const d = new Date(today);
+    d.setDate(today.getDate() - (20 - i));
+    const day = isoDate(d);
+    const orders = 40 + Math.floor(rng() * 36) + i;
+    const revenue = Math.round((1800 + rng() * 3200 + i * 55) * 100) / 100;
+    const buyers = Math.floor(orders * (0.62 + rng() * 0.2));
+    const aov = Math.round((revenue / orders) * 100) / 100;
+    revenueRows.push(`('${day}', ${orders}, ${buyers}, ${revenue}, ${aov})`);
+
+    const views = 320 + Math.floor(rng() * 241);
+    const carts = Math.floor(views * (0.28 + rng() * 0.1));
+    const checkouts = Math.floor(carts * (0.36 + rng() * 0.2));
+    const searches = 70 + Math.floor(rng() * 91);
+    funnelRows.push(`('${day}', ${views}, ${carts}, ${checkouts}, ${searches})`);
+  }
+
+  await connection.query(
+    `insert into gold.revenue_daily values ${revenueRows.join(",\n")}`
+  );
+  await connection.query(
+    `insert into gold.funnel_daily values ${funnelRows.join(",\n")}`
+  );
+
+  const ltvRows = [];
+  for (let i = 0; i < 24; i += 1) {
+    const cid = `cus_${(0xa100 + i).toString(16)}`;
+    const country = countries[i % countries.length];
+    const orders = 1 + Math.floor(rng() * 11);
+    const ltv = Math.round((80 + rng() * 1600 + orders * 40) * 100) / 100;
+    ltvRows.push(`('${cid}', '${country}', ${orders}, ${ltv})`);
+  }
+  await connection.query(`insert into gold.customer_ltv values ${ltvRows.join(",\n")}`);
+
+  await connection.query(`
+    create table gold.revenue_by_country as
+    select country,
+           round(sum(lifetime_revenue_eur), 2) as revenue_eur,
+           count(*)::integer as customers,
+           round(avg(lifetime_revenue_eur), 2) as avg_ltv
+    from gold.customer_ltv
+    group by 1
+    order by revenue_eur desc
+  `);
+}
+
+async function initDuckDB() {
+  const bundles = duckdb.getJsDelivrBundles();
+  // Prefer MVP bundle so SharedArrayBuffer / COOP headers are not required on Vercel.
+  const bundle = await duckdb.selectBundle({
+    mvp: bundles.mvp,
+    eh: bundles.eh,
+  });
+  const workerUrl = URL.createObjectURL(
+    new Blob([`importScripts("${bundle.mainWorker}");`], { type: "text/javascript" })
+  );
+  const worker = new Worker(workerUrl);
+  const logger = new duckdb.ConsoleLogger(duckdb.LogLevel.ERROR);
+  const db = new duckdb.AsyncDuckDB(logger, worker);
+  await db.instantiate(bundle.mainModule, bundle.pthreadWorker);
+  URL.revokeObjectURL(workerUrl);
+  conn = await db.connect();
+  await seedGold(conn);
+  return conn;
+}
+
+async function runSql(sql) {
+  const cleaned = sql.trim().replace(/;$/, "");
+  try {
+    const result = await conn.query(cleaned);
+    const rows = result.toArray().map((row) => {
+      const obj = {};
+      for (const key of Object.keys(row)) {
+        const v = row[key];
+        obj[key] = typeof v === "bigint" ? Number(v) : v;
+      }
+      return obj;
+    });
+    return { ok: true, sql: cleaned, rows, row_count: rows.length };
+  } catch (err) {
+    return { ok: false, sql: cleaned, error: String(err.message || err), rows: [], row_count: 0 };
+  }
+}
 
 function matchIntent(question) {
   const q = question.toLowerCase();
   const rules = [
-    ["gmv", ["gmv", "revenue", "sales", "ingresos", "factur"]],
+    ["gmv", ["gmv", "revenue", "sales", "ingresos", "factur", "merchandise"]],
     ["aov", ["aov", "average order", "ticket medio", "order value"]],
-    ["revenue_trend", ["trend", "daily", "over time", "evolución", "evolucion"]],
+    ["revenue_trend", ["trend", "daily", "over time", "evolución", "evolucion", "últimos", "ultimos"]],
     ["conversion", ["funnel", "conversion", "checkout", "cart", "conversión"]],
     ["top_customers", ["ltv", "customer", "cliente", "top", "lifetime"]],
-    ["by_country", ["country", "país", "pais", "geo", "region"]],
+    ["by_country", ["country", "país", "pais", "geo", "region", "españa", "spain"]],
   ];
   const hits = [];
   for (const [key, words] of rules) {
@@ -79,44 +210,62 @@ function matchIntent(question) {
   return hits.length ? [...new Set(hits)].slice(0, 3) : ["gmv", "conversion"];
 }
 
-function narrate(question, intents) {
+function narrate(question, findings) {
   const bits = [];
-  for (const intent of intents) {
-    const rows = TEMPLATES[intent].rows;
-    const row = rows[0];
-    if (intent === "gmv") {
+  for (const f of findings) {
+    if (!f.ok || !f.rows?.length) continue;
+    const row = f.rows[0];
+    if (row.gmv_eur != null) {
       bits.push(
-        `**GMV** is €${row.gmv_eur.toLocaleString()} across ${row.orders.toLocaleString()} paid orders (AOV €${row.aov_eur}).`
+        `**GMV** is €${Number(row.gmv_eur).toLocaleString()} across ${Number(row.orders).toLocaleString()} paid orders (AOV €${Number(row.aov_eur).toLocaleString()}).`
       );
-    } else if (intent === "aov") {
-      bits.push(`**AOV** sits at €${row.aov_eur} over ${row.orders.toLocaleString()} orders.`);
-    } else if (intent === "conversion") {
+    } else if (row.aov_eur != null && row.view_to_checkout_pct == null) {
       bits.push(
-        `Funnel: **${row.view_to_checkout_pct}%** view→checkout (${row.views.toLocaleString()} views → ${row.checkouts.toLocaleString()} checkouts; cart rate ${row.view_to_cart_pct}%).`
+        `**AOV** sits at €${Number(row.aov_eur).toLocaleString()} over ${Number(row.orders).toLocaleString()} orders.`
       );
-    } else if (intent === "top_customers") {
+    } else if (row.view_to_checkout_pct != null) {
       bits.push(
-        `Top LTV customers: ${rows
+        `Funnel: **${row.view_to_checkout_pct}%** view->checkout (${Number(row.views).toLocaleString()} views → ${Number(row.checkouts).toLocaleString()} checkouts; cart rate ${row.view_to_cart_pct}%).`
+      );
+    } else if (row.lifetime_revenue_eur != null) {
+      bits.push(
+        `Top LTV customers: ${f.rows
           .slice(0, 3)
-          .map((r) => `${r.customer_id} (${r.country}, €${r.lifetime_revenue_eur})`)
+          .map((r) => `${r.customer_id} (${r.country}, €${Number(r.lifetime_revenue_eur).toLocaleString()})`)
           .join(", ")}.`
       );
-    } else if (intent === "by_country") {
+    } else if (row.country != null && row.revenue_eur != null) {
       bits.push(
-        `Revenue by country leaders: ${rows
+        `Revenue by country leaders: ${f.rows
           .slice(0, 3)
-          .map((r) => `${r.country} €${r.revenue_eur.toLocaleString()}`)
+          .map((r) => `${r.country} €${Number(r.revenue_eur).toLocaleString()}`)
           .join(", ")}.`
       );
-    } else if (intent === "revenue_trend") {
-      const latest = GOLD.trend[GOLD.trend.length - 1];
-      bits.push(`Latest day **${latest.order_date}**: €${latest.revenue_eur} (${latest.orders_count} orders).`);
+    } else if (row.order_date != null && row.revenue_eur != null) {
+      bits.push(
+        `Latest day **${row.order_date}**: €${Number(row.revenue_eur).toLocaleString()} (${row.orders_count} orders).`
+      );
     }
   }
-  return `Based on gold marts (read-only DuckDB tools):\n\n${bits.join("\n\n")}\n\n_Question:_ ${question}`;
+  if (!bits.length) {
+    return "No reliable answer from gold marts. Try GMV, AOV, conversion, LTV or revenue by country.";
+  }
+  return `Based on live DuckDB-WASM gold marts:\n\n${bits.join("\n\n")}\n\n_Question:_ ${question}`;
 }
 
-function runCopilot(question) {
+function critic(findings) {
+  const ok = findings.filter((f) => f.ok);
+  const bad = findings.filter((f) => !f.ok);
+  const issues = [];
+  if (!ok.length) issues.push("No successful SQL tool calls.");
+  for (const f of bad) issues.push(`Failed: ${f.error}`);
+  for (const f of ok) if (!f.row_count) issues.push(`${f.label} returned 0 rows.`);
+  const confidence = ok.length && !issues.length ? "high" : ok.length ? "medium" : "low";
+  return { passed: ok.length > 0 && issues.length === 0, confidence, issues };
+}
+
+async function runCopilot(question) {
+  const started = performance.now();
   const q = question.trim() || "What is our GMV and conversion?";
   const intents = matchIntent(q);
   const steps = [
@@ -126,44 +275,71 @@ function runCopilot(question) {
       detail: `Matched intents: ${intents.join(", ")}`,
     },
   ];
-  const citations = [];
+
+  const findings = [];
   for (const intent of intents) {
-    const t = TEMPLATES[intent];
-    steps.push({ agent: "sql_analyst", action: "prepare_query", detail: t.label, sql: t.sql });
+    const tmpl = TEMPLATES[intent];
     steps.push({
       agent: "sql_analyst",
-      action: "tool_result",
-      detail: `${t.label}: ${t.rows.length} rows`,
-      rows_preview: t.rows.slice(0, 4),
+      action: "prepare_query",
+      detail: tmpl.label,
+      sql: tmpl.sql.replace(/\s+/g, " ").trim(),
     });
-    citations.push({ label: t.label, sql: t.sql });
+    const result = await runSql(tmpl.sql);
+    const finding = { intent, label: tmpl.label, ...result };
+    findings.push(finding);
+    if (result.ok) {
+      steps.push({
+        agent: "sql_analyst",
+        action: "tool_result",
+        detail: `${tmpl.label}: ${result.row_count} rows (live DuckDB)`,
+        rows_preview: result.rows.slice(0, 5),
+      });
+    } else {
+      steps.push({
+        agent: "sql_analyst",
+        action: "tool_error",
+        detail: result.error,
+        sql: result.sql,
+      });
+    }
   }
+
+  const critique = critic(findings);
   steps.push({
     agent: "critic",
     action: "validate",
-    detail: "confidence=high, passed=true",
+    detail: `confidence=${critique.confidence}, passed=${critique.passed}`,
   });
+  const answer = narrate(q, findings);
   steps.push({
     agent: "narrator",
     action: "compose_answer",
-    detail: "Deterministic narration (demo mode)",
+    detail: "Narrated from live query results",
   });
+
   return {
     question: q,
-    answer: narrate(q, intents),
+    answer,
     steps,
-    critique: { confidence: "high", passed: true },
-    citations,
-    latency_ms: 180 + Math.round(Math.random() * 220),
-    mode: "tools-only",
+    critique,
+    citations: findings
+      .filter((f) => f.ok)
+      .map((f) => ({ label: f.label, sql: f.sql })),
+    latency_ms: Math.round(performance.now() - started),
+    mode: "duckdb-wasm",
   };
 }
+
+/* ---------- UI ---------- */
 
 const messagesEl = document.getElementById("messages");
 const traceEl = document.getElementById("trace");
 const citationsEl = document.getElementById("citations");
+const statusEl = document.getElementById("status");
 const form = document.getElementById("form");
 const input = document.getElementById("input");
+const askBtn = document.getElementById("askBtn");
 const examplesEl = document.getElementById("examples");
 
 function escapeHtml(s) {
@@ -176,6 +352,7 @@ function addMessage(role, text, meta = "") {
   div.innerHTML = `${meta ? `<span class="meta">${meta}</span>` : ""}${escapeHtml(text)}`;
   messagesEl.appendChild(div);
   messagesEl.scrollTop = messagesEl.scrollHeight;
+  return div;
 }
 
 function renderTrace(payload) {
@@ -194,6 +371,7 @@ function renderTrace(payload) {
       </article>`;
     })
     .join("");
+
   const c = payload.critique || {};
   citationsEl.className = "citations";
   citationsEl.innerHTML = `
@@ -205,14 +383,24 @@ function renderTrace(payload) {
 }
 
 async function ask(question) {
+  if (!conn) return;
+  input.disabled = true;
+  askBtn.disabled = true;
   addMessage("user", question);
-  addMessage("assistant", "Running planner → SQL analyst → critic…", "copilot");
-  const pending = messagesEl.lastChild;
-  await new Promise((r) => setTimeout(r, 450 + Math.random() * 400));
-  const data = runCopilot(question);
-  pending.remove();
-  addMessage("assistant", data.answer, `copilot · ${data.mode}`);
-  renderTrace(data);
+  const pending = addMessage("assistant", "Running planner → live SQL → critic…", "copilot");
+  try {
+    const data = await runCopilot(question);
+    pending.remove();
+    addMessage("assistant", data.answer, `copilot · ${data.mode}`);
+    renderTrace(data);
+  } catch (err) {
+    pending.remove();
+    addMessage("assistant", `Error: ${err.message || err}`);
+  } finally {
+    input.disabled = false;
+    askBtn.disabled = false;
+    input.focus();
+  }
 }
 
 form.addEventListener("submit", (e) => {
@@ -223,21 +411,30 @@ form.addEventListener("submit", (e) => {
   ask(q);
 });
 
-const EXAMPLES = [
-  "What is our GMV and AOV?",
-  "How is the conversion funnel performing?",
-  "Who are the top customers by LTV?",
-  "Break down revenue by country",
-  "Show revenue trend for recent days",
-  "¿Cuál es el ticket medio y la conversión?",
-];
+async function boot() {
+  try {
+    await initDuckDB();
+    const count = await conn.query("select count(*)::int as n from gold.revenue_daily");
+    const n = Number(count.toArray()[0].n);
+    statusEl.textContent = `live · DuckDB-WASM · ${n} revenue days`;
+    statusEl.classList.add("live");
+    input.disabled = false;
+    askBtn.disabled = false;
 
-examplesEl.innerHTML = EXAMPLES.map((q) => `<button type="button">${escapeHtml(q)}</button>`).join("");
-examplesEl.querySelectorAll("button").forEach((btn, i) => {
-  btn.addEventListener("click", () => ask(EXAMPLES[i]));
-});
+    examplesEl.innerHTML = EXAMPLES.map((q) => `<button type="button">${escapeHtml(q)}</button>`).join("");
+    examplesEl.querySelectorAll("button").forEach((btn, i) => {
+      btn.addEventListener("click", () => ask(EXAMPLES[i]));
+    });
 
-addMessage(
-  "assistant",
-  "Ready. Ask about GMV, AOV, funnel conversion, LTV or revenue by country. Traces show every agent step."
-);
+    addMessage(
+      "assistant",
+      "DuckDB is running in your browser. Gold marts are seeded and every answer executes real SQL — open the trace to see the queries and row results."
+    );
+  } catch (err) {
+    statusEl.textContent = "DuckDB boot failed";
+    addMessage("assistant", `Could not start DuckDB-WASM: ${err.message || err}`);
+    console.error(err);
+  }
+}
+
+boot();

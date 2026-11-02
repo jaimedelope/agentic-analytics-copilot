@@ -10,7 +10,7 @@ Complements the [mini lakehouse](https://github.com/jaimedelope/mini-lakehouse) 
 
 **[agentic-analytics-copilot.vercel.app](https://agentic-analytics-copilot.vercel.app)**
 
-Browser simulation of the agent graph. Docker below runs the real FastAPI + DuckDB tool stack.
+The Vercel demo runs **real SQL in the browser** via DuckDB-WASM (planner → live queries → critic → narrator). Docker below is the FastAPI + native DuckDB stack.
 
 ## Architecture
 
