@@ -1,0 +1,13 @@
+agents/
+app/
+seed/
+data/
+docs/
+docker-compose.yml
+Dockerfile
+requirements.txt
+README.md
+.gitignore
+.env
+__pycache__/
+.venv/

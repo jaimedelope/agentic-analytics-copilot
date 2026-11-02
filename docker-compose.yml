@@ -1,0 +1,8 @@
+services:
+  copilot:
+    build: .
+    ports:
+      - "8092:8092"
+    environment:
+      - DUCKDB_PATH=/app/data/analytics.duckdb
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
