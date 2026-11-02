@@ -8,7 +8,7 @@ Complements the [mini lakehouse](https://github.com/jaimedelope/mini-lakehouse) 
 
 ## Live demo
 
-**[agentic-analytics-copilot.vercel.app](https://agentic-analytics-copilot.vercel.app)** *(public URL after deploy)*
+**[agentic-analytics-copilot.vercel.app](https://agentic-analytics-copilot.vercel.app)**
 
 Browser simulation of the agent graph. Docker below runs the real FastAPI + DuckDB tool stack.
 
