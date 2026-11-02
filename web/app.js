@@ -175,6 +175,16 @@ async function initDuckDB() {
   return conn;
 }
 
+function coerceValue(v) {
+  if (typeof v === "bigint") return Number(v);
+  if (v == null || typeof v === "string" || typeof v === "boolean") return v;
+  if (typeof v === "number") return v;
+  // DuckDB-WASM / Arrow may wrap numerics as objects
+  const n = Number(v);
+  if (!Number.isNaN(n) && String(v).trim() !== "") return n;
+  return String(v);
+}
+
 async function runSql(sql) {
   const cleaned = sql.trim().replace(/;$/, "");
   try {
@@ -182,8 +192,7 @@ async function runSql(sql) {
     const rows = result.toArray().map((row) => {
       const obj = {};
       for (const key of Object.keys(row)) {
-        const v = row[key];
-        obj[key] = typeof v === "bigint" ? Number(v) : v;
+        obj[key] = coerceValue(row[key]);
       }
       return obj;
     });
